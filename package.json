@@ -3,11 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local browser UI and Node backend for DeepSeek-powered GitHub vibe coding.",
+  "description": "Local browser UI and Node backend for a Deepgram-powered GitHub coding agent.",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
   }
 }
