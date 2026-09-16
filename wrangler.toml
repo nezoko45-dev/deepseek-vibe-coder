@@ -1,8 +1,0 @@
-name = "deepseek-github-vibe-coder"
-main = "worker.js"
-compatibility_date = "2026-09-15"
-workers_dev = true
-
-[vars]
-DEFAULT_REPO = "nezoko45-dev/deepseek-vibe-coder"
-DEEPSEEK_MODEL = "deepseek-v4-pro"
