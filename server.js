@@ -15,7 +15,6 @@ function loadConfig() {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); }
   catch { throw new Error("config.json is not valid JSON."); }
 }
-
 const config = loadConfig();
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || config.deepseekApiKey || "";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || config.githubToken || "";
@@ -31,10 +30,11 @@ function send(res, status, data, type = "application/json; charset=utf-8") {
   });
   res.end(type.startsWith("application/json") ? JSON.stringify(data, null, 2) : data);
 }
-
-function slug(value) {
-  return String(value || "task").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42) || "task";
+function serveApp(res) {
+  const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  return send(res, 200, html, "text/html; charset=utf-8");
 }
+function slug(value) { return String(value || "task").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42) || "task"; }
 function validRepo(repo) { return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo); }
 function validPath(p) { return typeof p === "string" && p.length > 0 && p.length <= 240 && !p.startsWith("/") && !p.includes("..\\") && !p.includes("../") && !p.includes("\\..\\"); }
 
@@ -57,16 +57,11 @@ async function askDeepSeek(messages) {
     return JSON.parse(match[0]);
   }
 }
-
 async function readBody(req) {
   let text = "";
-  for await (const chunk of req) {
-    text += chunk;
-    if (text.length > 200000) throw new Error("Request body is too large.");
-  }
+  for await (const chunk of req) { text += chunk; if (text.length > 200000) throw new Error("Request body is too large."); }
   return JSON.parse(text || "{}");
 }
-
 async function vibe(body) {
   const task = String(body.task || "").trim();
   const repo = String(body.repo || DEFAULT_REPO).trim();
@@ -75,22 +70,11 @@ async function vibe(body) {
   if (!validRepo(repo)) throw new Error("repo must look like owner/name.");
   if (!/^[A-Za-z0-9_.\/-]+$/.test(base)) throw new Error("Invalid base branch.");
   if (!GITHUB_TOKEN) throw new Error("Missing GitHub token. Put it in config.json.");
-
   const snapshot = await getRepositorySnapshot(GITHUB_TOKEN, repo, base);
-  const prompt = [
-    `USER TASK:\n${task}`,
-    `TARGET REPOSITORY: ${repo}`,
-    `BASE BRANCH: ${base}`,
-    `REPOSITORY FILES:\n${JSON.stringify(snapshot.files)}`
-  ].join("\n\n");
-
-  const plan = await askDeepSeek([
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: prompt }
-  ]);
+  const prompt = [`USER TASK:\n${task}`, `TARGET REPOSITORY: ${repo}`, `BASE BRANCH: ${base}`, `REPOSITORY FILES:\n${JSON.stringify(snapshot.files)}`].join("\n\n");
+  const plan = await askDeepSeek([{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }]);
   if (!plan || !Array.isArray(plan.files) || plan.files.length === 0) throw new Error("DeepSeek produced no file changes.");
   if (plan.files.length > 25) throw new Error("DeepSeek requested too many file changes.");
-
   const existing = new Set(snapshot.allPaths || snapshot.files.map(x => x.path));
   const changes = plan.files.map(x => ({ path: String(x.path || ""), action: String(x.action || "update"), content: x.content == null ? null : String(x.content) }));
   for (const change of changes) {
@@ -100,7 +84,6 @@ async function vibe(body) {
     if ((change.action === "update" || change.action === "delete") && !existing.has(change.path)) throw new Error(`File does not exist: ${change.path}`);
     if (change.action !== "delete" && (change.content || "").length > 100000) throw new Error(`File too large: ${change.path}`);
   }
-
   const branch = `vibe/${Date.now()}-${slug(task)}`;
   await createBranch(GITHUB_TOKEN, repo, branch, snapshot.commitSha);
   const commit = await createAtomicCommit(GITHUB_TOKEN, repo, branch, snapshot.treeSha, snapshot.commitSha, changes, plan.commitMessage || `vibe: ${task.slice(0, 60)}`);
@@ -112,22 +95,13 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "OPTIONS") return send(res, 204, "", "text/plain; charset=utf-8");
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    if (req.method === "GET" && url.pathname === "/") {
-      return send(res, 200, { name: "DeepSeek GitHub Vibe Coder", status: "online", endpoint: "POST /vibe", cloudflare: false, configured: Boolean(DEEPSEEK_API_KEY && GITHUB_TOKEN) });
-    }
-    if (req.method === "GET" && (url.pathname === "/index.html" || url.pathname === "/app")) {
-      const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
-      return send(res, 200, html, "text/html; charset=utf-8");
-    }
-    if (req.method === "POST" && url.pathname === "/vibe") {
-      const result = await vibe(await readBody(req));
-      return send(res, 200, result);
-    }
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/app")) return serveApp(res);
+    if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, { name: "DeepSeek GitHub Vibe Coder", status: "online", configured: Boolean(DEEPSEEK_API_KEY && GITHUB_TOKEN), cloudflare: false });
+    if (req.method === "POST" && url.pathname === "/vibe") return send(res, 200, await vibe(await readBody(req)));
     return send(res, 404, { error: "Not found" });
   } catch (error) {
     console.error(error);
     return send(res, 500, { error: error instanceof Error ? error.message : String(error) });
   }
 });
-
 server.listen(PORT, HOST, () => console.log(`DeepSeek Vibe Coder running at http://${HOST}:${PORT}`));
