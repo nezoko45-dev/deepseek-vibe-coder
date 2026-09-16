@@ -2,13 +2,14 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import WebSocket from "ws";
 import { getRepositorySnapshot, createBranch, createAtomicCommit, createPullRequest } from "./github.js";
 import { SYSTEM_PROMPT } from "./prompts.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
-const QWEN_URL = process.env.QWEN_URL || "http://127.0.0.1:11434/api/chat";
-const QWEN_MODEL = process.env.QWEN_MODEL || "qwen3-coder:30b";
+const DEEPGRAM_AGENT_URL = process.env.DEEPGRAM_AGENT_URL || "wss://agent.deepgram.com/v1/agent/converse";
+const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "gpt-5.6-luna";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
@@ -19,6 +20,7 @@ function loadConfig() {
 }
 const config = loadConfig();
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || config.githubToken || "";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || config.deepgramApiKey || "";
 const DEFAULT_REPO = process.env.DEFAULT_REPO || config.defaultRepo || "nezoko45-dev/deepseek-vibe-coder";
 
 function send(res, status, data, type = "application/json; charset=utf-8") {
@@ -30,35 +32,66 @@ function slug(value) { return String(value || "task").toLowerCase().replace(/[^a
 function validRepo(repo) { return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo); }
 function validPath(p) { return typeof p === "string" && p.length > 0 && p.length <= 240 && !p.startsWith("/") && !p.includes("..\\") && !p.includes("../") && !p.includes("\\..\\"); }
 
-async function askQwen(messages) {
-  let response;
-  try {
-    response = await fetch(QWEN_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: QWEN_MODEL, messages, stream: false, format: "json", options: { temperature: 0.15 } })
-    });
-  } catch {
-    throw new Error(`Qwen is not running. Install/start Ollama and make sure ${QWEN_MODEL} is available locally.`);
-  }
-  const text = await response.text();
-  if (!response.ok) throw new Error(`Qwen/Ollama ${response.status}: ${text.slice(0, 1200)}`);
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error("Qwen returned invalid Ollama JSON."); }
-  const content = data?.message?.content;
-  if (!content) throw new Error("Qwen returned no message content.");
-  try { return JSON.parse(content); }
-  catch {
-    const match = content.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("Qwen returned invalid coding-plan JSON.");
-    return JSON.parse(match[0]);
-  }
+function parseAgentJson(text) {
+  const cleaned = String(text || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  try { return JSON.parse(cleaned); } catch {}
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("Deepgram's coding agent returned no valid JSON plan.");
+  return JSON.parse(match[0]);
 }
+
+async function askDeepgram(prompt) {
+  if (!DEEPGRAM_API_KEY) throw new Error("Missing Deepgram API key. Add deepgramApiKey to config.json.");
+  return await new Promise((resolve, reject) => {
+    const ws = new WebSocket(DEEPGRAM_AGENT_URL, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
+    let settled = false;
+    let answer = "";
+    const finish = (fn, value) => { if (settled) return; settled = true; try { ws.close(); } catch {} fn(value); };
+    const timer = setTimeout(() => finish(reject, new Error("Deepgram coding agent timed out.")), 120000);
+    ws.on("open", () => {
+      ws.send(JSON.stringify({
+        type: "Settings",
+        audio: { input: { encoding: "linear16", sample_rate: 24000 }, output: { encoding: "linear16", sample_rate: 24000, container: "none" } },
+        agent: {
+          language: "en",
+          listen: { provider: { type: "deepgram", model: "flux-general-en" } },
+          speak: { provider: { type: "deepgram", model: "aura-2-asteria-en" } },
+          think: {
+            context_length: "max",
+            prompt: SYSTEM_PROMPT,
+            provider: { type: "open_ai", model: DEEPGRAM_MODEL, temperature: 0.15 }
+          }
+        },
+        flags: { history: true }
+      }));
+      ws.send(JSON.stringify({ type: "InjectUserMessage", content: prompt }));
+    });
+    ws.on("message", raw => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type === "Error") return finish(reject, new Error(msg.description || msg.message || "Deepgram agent error."));
+      if (msg.type === "AgentError") return finish(reject, new Error(msg.description || msg.message || "Deepgram agent error."));
+      if (msg.type === "History") {
+        const messages = msg.history || msg.messages || [];
+        const latest = [...messages].reverse().find(x => x.role === "assistant" && x.content);
+        if (latest) answer = latest.content;
+      }
+      if (msg.type === "AgentAudioDone" && answer) {
+        clearTimeout(timer);
+        finish(resolve, parseAgentJson(answer));
+      }
+    });
+    ws.on("error", err => { clearTimeout(timer); finish(reject, new Error(`Deepgram connection failed: ${err.message}`)); });
+    ws.on("close", () => { clearTimeout(timer); if (!settled) { if (answer) finish(resolve, parseAgentJson(answer)); else finish(reject, new Error("Deepgram coding agent closed before returning a result.")); } });
+  });
+}
+
 async function readBody(req) {
   let text = "";
   for await (const chunk of req) { text += chunk; if (text.length > 200000) throw new Error("Request body is too large."); }
   return JSON.parse(text || "{}");
 }
+
 async function vibe(body) {
   const task = String(body.task || "").trim();
   const repo = String(body.repo || DEFAULT_REPO).trim();
@@ -66,12 +99,20 @@ async function vibe(body) {
   if (!task) throw new Error("Missing task.");
   if (!validRepo(repo)) throw new Error("repo must look like owner/name.");
   if (!/^[A-Za-z0-9_.\/-]+$/.test(base)) throw new Error("Invalid base branch.");
-  if (!GITHUB_TOKEN) throw new Error("Missing GitHub token. Qwen itself needs no API key, but GitHub write access still requires a token.");
+  if (!DEEPGRAM_API_KEY) throw new Error("Missing Deepgram API key.");
+  if (!GITHUB_TOKEN) throw new Error("Missing GitHub token. Deepgram handles the coding intelligence, while GitHub authentication is still required to create branches, commits, and PRs.");
+
   const snapshot = await getRepositorySnapshot(GITHUB_TOKEN, repo, base);
-  const prompt = [`USER TASK:\n${task}`, `TARGET REPOSITORY: ${repo}`, `BASE BRANCH: ${base}`, `REPOSITORY FILES:\n${JSON.stringify(snapshot.files)}`].join("\n\n");
-  const plan = await askQwen([{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }]);
-  if (!plan || !Array.isArray(plan.files) || plan.files.length === 0) throw new Error("Qwen produced no file changes.");
-  if (plan.files.length > 25) throw new Error("Qwen requested too many file changes.");
+  const prompt = [
+    `USER TASK:\n${task}`,
+    `TARGET REPOSITORY: ${repo}`,
+    `BASE BRANCH: ${base}`,
+    `REPOSITORY FILES:\n${JSON.stringify(snapshot.files)}`,
+    "Return ONLY the JSON coding plan required by the system prompt. Do not explain it outside the JSON."
+  ].join("\n\n");
+  const plan = await askDeepgram(prompt);
+  if (!plan || !Array.isArray(plan.files) || plan.files.length === 0) throw new Error("Deepgram produced no file changes.");
+  if (plan.files.length > 25) throw new Error("Deepgram requested too many file changes.");
   const existing = new Set(snapshot.allPaths || snapshot.files.map(x => x.path));
   const changes = plan.files.map(x => ({ path: String(x.path || ""), action: String(x.action || "update"), content: x.content == null ? null : String(x.content) }));
   for (const change of changes) {
@@ -84,8 +125,8 @@ async function vibe(body) {
   const branch = `vibe/${Date.now()}-${slug(task)}`;
   await createBranch(GITHUB_TOKEN, repo, branch, snapshot.commitSha);
   const commit = await createAtomicCommit(GITHUB_TOKEN, repo, branch, snapshot.treeSha, snapshot.commitSha, changes, plan.commitMessage || `vibe: ${task.slice(0, 60)}`);
-  const pr = await createPullRequest(GITHUB_TOKEN, repo, branch, base, plan.prTitle || `Qwen coding: ${task.slice(0, 60)}`, plan.prBody || `Qwen generated this change from the task:\n\n${task}`);
-  return { ok: true, summary: plan.summary || "Changes generated by local Qwen.", repo, base, branch, commit: commit.sha, pullRequestUrl: pr.html_url, changes: changes.map(x => ({ path: x.path, action: x.action })) };
+  const pr = await createPullRequest(GITHUB_TOKEN, repo, branch, base, plan.prTitle || `Deepgram coding: ${task.slice(0, 60)}`, plan.prBody || `Deepgram generated this change from the task:\n\n${task}`);
+  return { ok: true, summary: plan.summary || "Changes generated by Deepgram's coding agent.", repo, base, branch, commit: commit.sha, pullRequestUrl: pr.html_url, changes: changes.map(x => ({ path: x.path, action: x.action })) };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -94,9 +135,14 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/app")) return serveApp(res);
     if (req.method === "GET" && url.pathname === "/api/status") {
-      let qwenOnline = false;
-      try { const r = await fetch(QWEN_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: QWEN_MODEL, messages: [{ role: "user", content: "Reply with OK." }], stream: false }) }); qwenOnline = r.ok; } catch {}
-      return send(res, 200, { name: "Qwen GitHub Vibe Coder", status: "online", qwenOnline, model: QWEN_MODEL, githubConfigured: Boolean(GITHUB_TOKEN), apiKeyRequired: false, cloudflare: false });
+      let deepgramOnline = false;
+      if (DEEPGRAM_API_KEY) {
+        try {
+          const r = await fetch("https://api.deepgram.com/v1/projects", { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
+          deepgramOnline = r.ok;
+        } catch {}
+      }
+      return send(res, 200, { name: "Deepgram GitHub Vibe Coder", status: "online", deepgramOnline, model: DEEPGRAM_MODEL, githubConfigured: Boolean(GITHUB_TOKEN), apiKeyRequired: true, cloudflare: false, ollama: false });
     }
     if (req.method === "POST" && url.pathname === "/vibe") return send(res, 200, await vibe(await readBody(req)));
     return send(res, 404, { error: "Not found" });
@@ -105,4 +151,4 @@ const server = http.createServer(async (req, res) => {
     return send(res, 500, { error: error instanceof Error ? error.message : String(error) });
   }
 });
-server.listen(PORT, HOST, () => console.log(`Qwen Vibe Coder running at http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`Deepgram Vibe Coder running at http://${HOST}:${PORT}`));
