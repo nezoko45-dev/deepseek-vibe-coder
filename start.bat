@@ -17,6 +17,7 @@ if not exist "config.json" (
   pause
   exit /b 0
 )
+start "DeepSeek Vibe Coder Backend" /min cmd /c "node server.js"
+timeout /t 2 /nobreak >nul
 start "" "http://127.0.0.1:8787"
-node server.js
-pause
+exit /b 0
