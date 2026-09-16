@@ -1,0 +1,13 @@
+{
+  "name": "deepseek-vibe-coder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local browser UI and Node backend for DeepSeek-powered GitHub vibe coding.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
