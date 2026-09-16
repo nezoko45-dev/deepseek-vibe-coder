@@ -1,28 +1,55 @@
 # DeepSeek GitHub Vibe Coder
 
-A Cloudflare Worker that turns a plain-English coding request into a GitHub branch, atomic commit, and pull request using DeepSeek's API and raw GitHub REST `fetch()` calls.
+A local Windows-friendly browser app that turns a plain-English coding request into a GitHub branch, atomic commit, and pull request using DeepSeek and the GitHub REST API.
 
-## What it does
+**No Cloudflare. No Python. No Octokit.**
+
+## How it works
 
 ```text
 Your coding task
       ↓
-Cloudflare Worker
+Chrome UI
+      ↓
+Local Node backend
       ↓
 Read repository files from GitHub
       ↓
 DeepSeek plans the change
       ↓
-Create a new vibe/* branch
+Create a vibe/* branch
       ↓
 Create one atomic Git commit
       ↓
 Open a GitHub Pull Request
 ```
 
-No Python and no Octokit are used.
+## Windows quick start
 
-## API
+1. Make a copy of `config.example.json` named `config.json`.
+2. Put your DeepSeek API key and GitHub token into `config.json`.
+3. Double-click `start.bat`.
+4. The backend runs at `http://127.0.0.1:8787`.
+5. Open that address in Chrome.
+
+`config.json` is ignored by Git so your keys are not committed.
+
+## Configuration
+
+```json
+{
+  "deepseekApiKey": "YOUR_DEEPSEEK_API_KEY",
+  "githubToken": "YOUR_GITHUB_TOKEN",
+  "deepseekModel": "deepseek-v4-pro",
+  "defaultRepo": "nezoko45-dev/deepseek-vibe-coder"
+}
+```
+
+The GitHub token needs permission to read the target repository, create branches/commits, and create pull requests.
+
+## Request API
+
+The local backend accepts:
 
 `POST /vibe`
 
@@ -34,44 +61,18 @@ No Python and no Octokit are used.
 }
 ```
 
-Send an authorization header:
-
-```text
-Authorization: Bearer YOUR_AGENT_KEY
-```
-
 The response includes the generated branch, commit SHA, changed files, and pull-request URL.
-
-## Secrets
-
-Configure these as Cloudflare Worker secrets. **Do not put them in GitHub files.**
-
-- `DEEPSEEK_API_KEY` — DeepSeek API key.
-- `GITHUB_TOKEN` — GitHub token with access to the repositories the agent should modify. For a personal setup, a fine-grained token limited to the target repositories is preferable.
-- `AGENT_KEY` — a private key you invent and use when calling `/vibe`.
-
-The public variables in `wrangler.toml` are not secrets.
-
-## Cloudflare setup
-
-The repository is ready for a Cloudflare Worker deployment. In the Cloudflare dashboard, create/import a Worker from this project and configure the three secrets above. The Worker entry point is `worker.js`.
-
-For automated deployment later, a GitHub Actions workflow can be added with Cloudflare deployment credentials kept as repository secrets.
 
 ## Safety built in
 
-The agent:
+- Secrets stay in local `config.json` and are never included in the DeepSeek repository prompt.
+- Path traversal is rejected.
+- Generated file count and file size are limited.
+- Updates/deletes are restricted to files that exist in the repository.
+- Changes are made on a separate `vibe/*` branch.
+- Each request creates one atomic Git commit.
+- A pull request is opened instead of changing `main` directly.
 
-- never receives your secrets in the DeepSeek prompt;
-- rejects path traversal attempts;
-- limits the number and size of generated file changes;
-- only updates/deletes files that exist in the repository snapshot;
-- creates a separate `vibe/*` branch instead of changing `main` directly;
-- makes one atomic Git commit;
-- opens a pull request for review.
+## Limitation
 
-DeepSeek is instructed to return complete file contents, not partial patches, which keeps the Git operation deterministic.
-
-## Important limitation
-
-This is a coding agent bridge, not an execution sandbox. The Worker can read and modify repository files, but it does not run arbitrary project commands or tests inside the target repository. A later version can add GitHub Actions-based test/review loops.
+This agent can read and modify GitHub repository files, but it does not execute arbitrary commands inside the target repository. Tests can be added later through a controlled CI workflow.
