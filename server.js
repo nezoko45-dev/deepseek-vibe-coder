@@ -9,6 +9,19 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+function loadConfig() {
+  const file = path.join(__dirname, "config.json");
+  if (!fs.existsSync(file)) return {};
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch { throw new Error("config.json is not valid JSON."); }
+}
+
+const config = loadConfig();
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || config.deepseekApiKey || "";
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || config.githubToken || "";
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || config.deepseekModel || "deepseek-v4-pro";
+const DEFAULT_REPO = process.env.DEFAULT_REPO || config.defaultRepo || "";
+
 function send(res, status, data, type = "application/json; charset=utf-8") {
   res.writeHead(status, {
     "content-type": type,
@@ -22,22 +35,15 @@ function send(res, status, data, type = "application/json; charset=utf-8") {
 function slug(value) {
   return String(value || "task").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42) || "task";
 }
-
 function validRepo(repo) { return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo); }
 function validPath(p) { return typeof p === "string" && p.length > 0 && p.length <= 240 && !p.startsWith("/") && !p.includes("..\\") && !p.includes("../") && !p.includes("\\..\\"); }
 
 async function askDeepSeek(messages) {
-  const key = process.env.DEEPSEEK_API_KEY;
-  if (!key) throw new Error("Missing DEEPSEEK_API_KEY environment variable.");
+  if (!DEEPSEEK_API_KEY) throw new Error("Missing DeepSeek API key. Put it in config.json.");
   const response = await fetch(process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model: process.env.DEEPSEEK_MODEL || "deepseek-v4-pro",
-      messages,
-      temperature: 0.15,
-      response_format: { type: "json_object" }
-    })
+    headers: { "content-type": "application/json", authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, temperature: 0.15, response_format: { type: "json_object" } })
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`DeepSeek ${response.status}: ${text.slice(0, 1200)}`);
@@ -63,14 +69,14 @@ async function readBody(req) {
 
 async function vibe(body) {
   const task = String(body.task || "").trim();
-  const repo = String(body.repo || process.env.DEFAULT_REPO || "").trim();
+  const repo = String(body.repo || DEFAULT_REPO).trim();
   const base = String(body.base || "main").trim();
   if (!task) throw new Error("Missing task.");
   if (!validRepo(repo)) throw new Error("repo must look like owner/name.");
   if (!/^[A-Za-z0-9_.\/-]+$/.test(base)) throw new Error("Invalid base branch.");
-  if (!process.env.GITHUB_TOKEN) throw new Error("Missing GITHUB_TOKEN environment variable.");
+  if (!GITHUB_TOKEN) throw new Error("Missing GitHub token. Put it in config.json.");
 
-  const snapshot = await getRepositorySnapshot(process.env.GITHUB_TOKEN, repo, base);
+  const snapshot = await getRepositorySnapshot(GITHUB_TOKEN, repo, base);
   const prompt = [
     `USER TASK:\n${task}`,
     `TARGET REPOSITORY: ${repo}`,
@@ -85,12 +91,8 @@ async function vibe(body) {
   if (!plan || !Array.isArray(plan.files) || plan.files.length === 0) throw new Error("DeepSeek produced no file changes.");
   if (plan.files.length > 25) throw new Error("DeepSeek requested too many file changes.");
 
-  const existing = new Set(snapshot.files.map(x => x.path));
-  const changes = plan.files.map(x => ({
-    path: String(x.path || ""),
-    action: String(x.action || "update"),
-    content: x.content == null ? null : String(x.content)
-  }));
+  const existing = new Set(snapshot.allPaths || snapshot.files.map(x => x.path));
+  const changes = plan.files.map(x => ({ path: String(x.path || ""), action: String(x.action || "update"), content: x.content == null ? null : String(x.content) }));
   for (const change of changes) {
     if (!validPath(change.path)) throw new Error(`Invalid file path: ${change.path}`);
     if (!["create", "update", "delete"].includes(change.action)) throw new Error(`Invalid action for ${change.path}`);
@@ -100,9 +102,9 @@ async function vibe(body) {
   }
 
   const branch = `vibe/${Date.now()}-${slug(task)}`;
-  await createBranch(process.env.GITHUB_TOKEN, repo, branch, snapshot.commitSha);
-  const commit = await createAtomicCommit(process.env.GITHUB_TOKEN, repo, branch, snapshot.treeSha, snapshot.commitSha, changes, plan.commitMessage || `vibe: ${task.slice(0, 60)}`);
-  const pr = await createPullRequest(process.env.GITHUB_TOKEN, repo, branch, base, plan.prTitle || `Vibe coding: ${task.slice(0, 60)}`, plan.prBody || `DeepSeek generated this change from the task:\n\n${task}`);
+  await createBranch(GITHUB_TOKEN, repo, branch, snapshot.commitSha);
+  const commit = await createAtomicCommit(GITHUB_TOKEN, repo, branch, snapshot.treeSha, snapshot.commitSha, changes, plan.commitMessage || `vibe: ${task.slice(0, 60)}`);
+  const pr = await createPullRequest(GITHUB_TOKEN, repo, branch, base, plan.prTitle || `Vibe coding: ${task.slice(0, 60)}`, plan.prBody || `DeepSeek generated this change from the task:\n\n${task}`);
   return { ok: true, summary: plan.summary || "Changes generated.", repo, base, branch, commit: commit.sha, pullRequestUrl: pr.html_url, changes: changes.map(x => ({ path: x.path, action: x.action })) };
 }
 
@@ -111,9 +113,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") return send(res, 204, "", "text/plain; charset=utf-8");
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "GET" && url.pathname === "/") {
-      return send(res, 200, { name: "DeepSeek GitHub Vibe Coder", status: "online", endpoint: "POST /vibe" });
+      return send(res, 200, { name: "DeepSeek GitHub Vibe Coder", status: "online", endpoint: "POST /vibe", cloudflare: false, configured: Boolean(DEEPSEEK_API_KEY && GITHUB_TOKEN) });
     }
-    if (req.method === "GET" && url.pathname === "/index.html") {
+    if (req.method === "GET" && (url.pathname === "/index.html" || url.pathname === "/app")) {
       const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
       return send(res, 200, html, "text/html; charset=utf-8");
     }
