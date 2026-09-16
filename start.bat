@@ -17,5 +17,6 @@ if not exist "config.json" (
   pause
   exit /b 0
 )
+start "" "http://127.0.0.1:8787"
 node server.js
 pause
