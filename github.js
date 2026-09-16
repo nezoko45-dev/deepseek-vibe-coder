@@ -30,6 +30,7 @@ export async function getRepositorySnapshot(token, repo, branch, limits = {}) {
   const commit = await request(token, `/repos/${repo}/git/commits/${commitSha}`);
   const tree = await request(token, `/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
 
+  const allPaths = (tree.tree || []).filter(x => x.type === "blob").map(x => x.path);
   const textExt = /\.(js|mjs|cjs|ts|tsx|jsx|html?|css|json|md|txt|xml|yaml|yml|toml|ini|cfg|py|java|cs|cpp|h|hpp|go|rs|php|rb|lua|sql|sh|bat|ps1)$/i;
   const candidates = (tree.tree || [])
     .filter(x => x.type === "blob" && textExt.test(x.path))
@@ -37,11 +38,12 @@ export async function getRepositorySnapshot(token, repo, branch, limits = {}) {
 
   const files = [];
   let used = 0;
+  const decoder = new TextDecoder();
   for (const item of candidates) {
     if (used >= maxBytes) break;
     const blob = await request(token, `/repos/${repo}/git/blobs/${item.sha}`);
     const content = blob.encoding === "base64"
-      ? atob(blob.content.replace(/\n/g, ""))
+      ? decoder.decode(Uint8Array.from(atob(blob.content.replace(/\n/g, "")), c => c.charCodeAt(0)))
       : String(blob.content || "");
     const remaining = maxBytes - used;
     const clipped = content.length > remaining ? content.slice(0, remaining) + "\n/* [clipped by agent] */" : content;
@@ -49,7 +51,7 @@ export async function getRepositorySnapshot(token, repo, branch, limits = {}) {
     used += clipped.length;
   }
 
-  return { repo, branch, commitSha, treeSha: commit.tree.sha, files };
+  return { repo, branch, commitSha, treeSha: commit.tree.sha, files, allPaths };
 }
 
 export async function createBranch(token, repo, branch, sha) {
