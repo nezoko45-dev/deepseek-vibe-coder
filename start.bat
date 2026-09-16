@@ -8,23 +8,25 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-where ollama >nul 2>nul
-if errorlevel 1 (
-  echo Ollama is required for local Qwen coding.
-  echo Install Ollama, then run this file again.
-  pause
-  exit /b 1
+if not exist "node_modules\ws\package.json" (
+  echo Installing the small WebSocket dependency for Deepgram...
+  call npm install --no-fund --no-audit
+  if errorlevel 1 (
+    echo Failed to install the required dependency.
+    pause
+    exit /b 1
+  )
 )
 if not exist "config.json" (
   copy /y "config.example.json" "config.json" >nul
   echo.
   echo Created config.json.
-  echo Open config.json and enter your GitHub token.
-  echo No Qwen API key is required.
+  echo Open config.json and enter your Deepgram API key and GitHub token.
+  echo No Qwen/Ollama installation is required.
   pause
   exit /b 0
 )
-start "Qwen Vibe Coder Backend" /min cmd /c "node server.js"
+start "Deepgram Vibe Coder Backend" /min cmd /c "node server.js"
 timeout /t 2 /nobreak >nul
 start "" "http://127.0.0.1:8787"
 exit /b 0
