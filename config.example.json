@@ -1,5 +1,5 @@
 {
-  "deepgramApiKey": "PASTE_YOUR_DEEPGRAM_API_KEY_HERE",
+  "groqApiKey": "PASTE_YOUR_GROQ_API_KEY_HERE",
   "githubToken": "PASTE_YOUR_GITHUB_TOKEN_HERE",
   "defaultRepo": "nezoko45-dev/deepseek-vibe-coder"
 }
