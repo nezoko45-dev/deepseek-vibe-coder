@@ -57,7 +57,6 @@ async function askDeepgram(prompt) {
           listen: { provider: { type: "deepgram", model: "flux-general-en" } },
           speak: { provider: { type: "deepgram", model: "aura-2-asteria-en" } },
           think: {
-            context_length: "max",
             prompt: SYSTEM_PROMPT,
             provider: { type: "open_ai", model: DEEPGRAM_MODEL, temperature: 0.15 }
           }
