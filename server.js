@@ -9,7 +9,7 @@ import { SYSTEM_PROMPT } from "./prompts.js";
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
 const DEEPGRAM_AGENT_URL = process.env.DEEPGRAM_AGENT_URL || "wss://agent.deepgram.com/v1/agent/converse";
-const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "gpt-5.6-luna";
+const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "gpt-5-mini";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
@@ -31,7 +31,6 @@ function serveApp(res) { return send(res, 200, fs.readFileSync(path.join(__dirna
 function slug(value) { return String(value || "task").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42) || "task"; }
 function validRepo(repo) { return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo); }
 function validPath(p) { return typeof p === "string" && p.length > 0 && p.length <= 240 && !p.startsWith("/") && !p.includes("..\\") && !p.includes("../") && !p.includes("\\..\\"); }
-
 function parseAgentJson(text) {
   const cleaned = String(text || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
   try { return JSON.parse(cleaned); } catch {}
@@ -46,8 +45,9 @@ async function askDeepgram(prompt) {
     const ws = new WebSocket(DEEPGRAM_AGENT_URL, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
     let settled = false;
     let answer = "";
-    const finish = (fn, value) => { if (settled) return; settled = true; try { ws.close(); } catch {} fn(value); };
+    let audioDone = false;
     const timer = setTimeout(() => finish(reject, new Error("Deepgram coding agent timed out.")), 120000);
+    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); try { ws.close(); } catch {} fn(value); };
     ws.on("open", () => {
       ws.send(JSON.stringify({
         type: "Settings",
@@ -56,10 +56,10 @@ async function askDeepgram(prompt) {
           language: "en",
           listen: { provider: { type: "deepgram", model: "flux-general-en" } },
           speak: { provider: { type: "deepgram", model: "aura-2-asteria-en" } },
-          think: {
-            prompt: SYSTEM_PROMPT,
-            provider: { type: "open_ai", model: DEEPGRAM_MODEL, temperature: 0.15 }
-          }
+          think: [
+            { provider: { type: "open_ai", model: DEEPGRAM_MODEL, temperature: 0.15 }, prompt: SYSTEM_PROMPT },
+            { provider: { type: "open_ai", model: "gpt-4.1-mini", temperature: 0.15 }, prompt: SYSTEM_PROMPT }
+          ]
         },
         flags: { history: true }
       }));
@@ -68,20 +68,25 @@ async function askDeepgram(prompt) {
     ws.on("message", raw => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (msg.type === "Error") return finish(reject, new Error(msg.description || msg.message || "Deepgram agent error."));
-      if (msg.type === "AgentError") return finish(reject, new Error(msg.description || msg.message || "Deepgram agent error."));
+      if (msg.type === "Error" || msg.type === "AgentError") return finish(reject, new Error(msg.description || msg.message || msg.code || "Deepgram agent error."));
+      if (msg.type === "Warning" && msg.code === "THINK_REQUEST_FAILED") return finish(reject, new Error(`Deepgram LLM request failed: ${msg.description || "both configured think providers failed"}`));
       if (msg.type === "History") {
         const messages = msg.history || msg.messages || [];
         const latest = [...messages].reverse().find(x => x.role === "assistant" && x.content);
         if (latest) answer = latest.content;
       }
-      if (msg.type === "AgentAudioDone" && answer) {
-        clearTimeout(timer);
-        finish(resolve, parseAgentJson(answer));
+      if (msg.type === "AgentAudioDone") audioDone = true;
+      if (answer && audioDone) {
+        try { finish(resolve, parseAgentJson(answer)); }
+        catch (err) { finish(reject, err); }
       }
     });
-    ws.on("error", err => { clearTimeout(timer); finish(reject, new Error(`Deepgram connection failed: ${err.message}`)); });
-    ws.on("close", () => { clearTimeout(timer); if (!settled) { if (answer) finish(resolve, parseAgentJson(answer)); else finish(reject, new Error("Deepgram coding agent closed before returning a result.")); } });
+    ws.on("error", err => finish(reject, new Error(`Deepgram connection failed: ${err.message}`)));
+    ws.on("close", () => {
+      if (settled) return;
+      if (answer) { try { finish(resolve, parseAgentJson(answer)); } catch (err) { finish(reject, err); } }
+      else finish(reject, new Error("Deepgram coding agent closed before returning a result."));
+    });
   });
 }
 
@@ -136,10 +141,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/status") {
       let deepgramOnline = false;
       if (DEEPGRAM_API_KEY) {
-        try {
-          const r = await fetch("https://api.deepgram.com/v1/projects", { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
-          deepgramOnline = r.ok;
-        } catch {}
+        try { const r = await fetch("https://api.deepgram.com/v1/projects", { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } }); deepgramOnline = r.ok; } catch {}
       }
       return send(res, 200, { name: "Deepgram GitHub Vibe Coder", status: "online", deepgramOnline, model: DEEPGRAM_MODEL, githubConfigured: Boolean(GITHUB_TOKEN), apiKeyRequired: true, cloudflare: false, ollama: false });
     }
